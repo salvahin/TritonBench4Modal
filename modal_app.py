@@ -57,59 +57,36 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 # --------------------------------------------------------------------------- #
 # Image — patches TritonBench's hardcoded paths so the eval scripts run inside
 # a clean container without any local-machine assumptions.
+#
+# Each `.run_commands(...)` argument becomes one Dockerfile RUN. Modal's legacy
+# image builder treats every newline inside a single argument as a new
+# Dockerfile instruction, so we keep each patch on a single line via `sed -i`.
 # --------------------------------------------------------------------------- #
-
-PATCH_SCRIPT = rf"""
-set -euo pipefail
-cd {REPO_DIR}
-
-python - <<'PY'
-import re, pathlib
-
-REPO = "{REPO_DIR}"
-
-def patch(path, replacements):
-    p = pathlib.Path(path)
-    src = p.read_text()
-    for pattern, repl in replacements:
-        new, n = re.subn(pattern, repl, src, flags=re.MULTILINE)
-        assert n >= 1, f"pattern not found in {{path}}: {{pattern}}"
-        src = new
-    p.write_text(src)
-    print("patched", path)
 
 # 0_call_acc.py — wrong dataset filename (.json vs .jsonl), wrong test folder
 # (G instead of T), and a hardcoded conda interpreter path.
-patch(
-    f"{{REPO}}/EVAL/eval_T/0_call_acc.py",
-    [
-        (r'^statis_path = .*$',
-         f'statis_path = "{{REPO}}/data/TritonBench_T_v1.jsonl"'),
-        (r'^py_folder = .*$',
-         f'py_folder = "{{REPO}}/data/TritonBench_T_v1/"'),
-        (r'^py_interpreter = .*$',
-         'import sys as _sys\npy_interpreter = _sys.executable'),
-    ],
+PATCH_CALL_ACC = (
+    f"""sed -i """
+    f"""-e 's|^statis_path = .*|statis_path = "{REPO_DIR}/data/TritonBench_T_v1.jsonl"|' """
+    f"""-e 's|^py_folder = .*|py_folder = "{REPO_DIR}/data/TritonBench_T_v1/"|' """
+    f"""-e 's|^py_interpreter = .*|import sys; py_interpreter = sys.executable|' """
+    f"""{REPO_DIR}/EVAL/eval_T/0_call_acc.py"""
 )
 
-# 1_exe_acc.py — hardcoded interpreter path; gold_folder is already correct.
-patch(
-    f"{{REPO}}/EVAL/eval_T/1_exe_acc.py",
-    [
-        (r'^gold_folder = .*$',
-         f'gold_folder = "{{REPO}}/data/TritonBench_T_v1/"'),
-        (r'^py_interpreter = .*$',
-         'import sys as _sys\npy_interpreter = _sys.executable'),
-    ],
+# 1_exe_acc.py — same hardcoded conda interpreter path; gold_folder anchored
+# to absolute path.
+PATCH_EXE_ACC = (
+    f"""sed -i """
+    f"""-e 's|^gold_folder = .*|gold_folder = "{REPO_DIR}/data/TritonBench_T_v1/"|' """
+    f"""-e 's|^py_interpreter = .*|import sys; py_interpreter = sys.executable|' """
+    f"""{REPO_DIR}/EVAL/eval_T/1_exe_acc.py"""
 )
 
 # multiprocess_gpu_run.py — assumes 8 GPUs; we have one.
-patch(
-    f"{{REPO}}/performance_metrics/perf_T/run_bench/multiprocess_gpu_run.py",
-    [(r'^gpu_count = .*$', 'gpu_count = 1')],
+PATCH_PERF = (
+    f"""sed -i 's|^gpu_count = .*|gpu_count = 1|' """
+    f"""{REPO_DIR}/performance_metrics/perf_T/run_bench/multiprocess_gpu_run.py"""
 )
-PY
-"""
 
 
 image = (
@@ -128,7 +105,7 @@ image = (
         "openai>=1.50",
     )
     .run_commands(f"git clone --depth 1 {TRITONBENCH_REPO} {REPO_DIR}")
-    .run_commands(PATCH_SCRIPT)
+    .run_commands(PATCH_CALL_ACC, PATCH_EXE_ACC, PATCH_PERF)
 )
 
 app = modal.App(APP_NAME, image=image)
