@@ -38,6 +38,13 @@ modal secret create tritonbench-llm ANTHROPIC_API_KEY=sk-ant-...
 modal secret create tritonbench-llm OPENAI_API_KEY=sk-...
 ```
 
+**Already have a secret with a different name?** Point the app at it once with
+an environment variable instead of editing code:
+
+```bash
+export TRITONBENCH_LLM_SECRET=openai-secret    # or whatever yours is called
+```
+
 You only need the secret if you want this project to **generate** the Triton
 predictions for you. If you already have a `predictions.jsonl` from somewhere
 else, skip it and use `evaluate_only` (see below).
@@ -50,22 +57,22 @@ else, skip it and use `evaluate_only` (see below).
 
 ```bash
 # Smoke test — first 5 ops, costs pennies, finishes in a few minutes
-modal run modal_app.py -- --limit 5
+modal run modal_app.py::main --limit 5
 
 # Full run — all 166 ops, defaults to Anthropic Claude Sonnet 4.6
-modal run modal_app.py
+modal run modal_app.py::main
 
 # Use OpenAI instead
-modal run modal_app.py -- --provider openai --model gpt-4o-mini
+modal run modal_app.py::main --provider openai --model gpt-4o-mini
 
 # Use the "complex" instruction variant
-modal run modal_app.py -- --dataset comp
+modal run modal_app.py::main --dataset comp
 ```
 
 ### Bring your own predictions
 
 ```bash
-modal run modal_app.py::evaluate_only -- --predictions ./my_predictions.jsonl
+modal run modal_app.py::evaluate_only --predictions ./my_predictions.jsonl
 ```
 
 `my_predictions.jsonl` must have one JSON object per line. Each object needs:
@@ -92,7 +99,7 @@ and reuse those instruction strings.
 ### Generate only
 
 ```bash
-modal run modal_app.py::generate_only -- --provider anthropic --model claude-sonnet-4-6
+modal run modal_app.py::generate_only --provider anthropic --model claude-sonnet-4-6
 ```
 
 Predictions land in the persistent volume `tritonbench-t-data`.

@@ -54,6 +54,12 @@ REPO_DIR = "/opt/TritonBench"
 DEFAULT_PROVIDER = "anthropic"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
+# Name of the Modal Secret that holds your LLM API key(s) (e.g. ANTHROPIC_API_KEY,
+# OPENAI_API_KEY). Override with an env var if your existing secret is named
+# differently — no code edit required:
+#     export TRITONBENCH_LLM_SECRET=openai-secret
+LLM_SECRET_NAME = os.environ.get("TRITONBENCH_LLM_SECRET", "tritonbench-llm")
+
 # --------------------------------------------------------------------------- #
 # Image — patches TritonBench's hardcoded paths so the eval scripts run inside
 # a clean container without any local-machine assumptions.
@@ -106,6 +112,13 @@ image = (
     )
     .run_commands(f"git clone --depth 1 {TRITONBENCH_REPO} {REPO_DIR}")
     .run_commands(PATCH_CALL_ACC, PATCH_EXE_ACC, PATCH_PERF)
+    # ProcessPoolExecutor pickles workers by qualified module name, so the
+    # eval scripts must be importable as plain `call_acc` / `exe_acc` from any
+    # subprocess. Module names can't start with a digit, so symlink them.
+    .run_commands(
+        f"ln -s {REPO_DIR}/EVAL/eval_T/0_call_acc.py {REPO_DIR}/EVAL/eval_T/call_acc.py",
+        f"ln -s {REPO_DIR}/EVAL/eval_T/1_exe_acc.py {REPO_DIR}/EVAL/eval_T/exe_acc.py",
+    )
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -175,11 +188,30 @@ def _gen_openai(messages: list[dict], model: str) -> str:
 _GENERATORS = {"anthropic": _gen_anthropic, "openai": _gen_openai}
 
 
+def _extract_code(text: str) -> str:
+    """Strip Markdown code fences from an LLM reply; return raw Python source.
+
+    Upstream's ``clear_code()`` only strips the opening ```` ```python ```` fence
+    and leaves the closing ```` ``` ```` in place, which trips a ``SyntaxError``
+    when the file is executed. So we hand the eval pipeline already-clean code.
+    """
+    import re
+
+    s = text.strip()
+    m = re.search(r"```(?:python|py)?\s*\n(.*?)\n```", s, re.DOTALL)
+    if m:
+        return m.group(1).strip() + "\n"
+    # No closing fence (truncated reply, etc.) — drop only the opening one.
+    s = re.sub(r"^```(?:python|py)?\s*\n?", "", s)
+    s = re.sub(r"\n?```\s*$", "", s)
+    return s.strip() + "\n"
+
+
 @app.function(
     timeout=60 * 60 * 4,
     cpu=4,
     volumes={DATA_DIR: data_volume},
-    secrets=[modal.Secret.from_name("tritonbench-llm")],
+    secrets=[modal.Secret.from_name(LLM_SECRET_NAME)],
 )
 def generate_predictions(
     provider: str = DEFAULT_PROVIDER,
@@ -210,10 +242,11 @@ def generate_predictions(
     def _do(idx_item):
         i, item = idx_item
         try:
-            text = gen_fn(_build_messages(item), model)
+            raw = gen_fn(_build_messages(item), model)
+            code = _extract_code(raw)
         except Exception as e:  # noqa: BLE001
-            text = f"```python\n# generation failed: {e}\n```"
-        return i, {"instruction": item["instruction"], "predict": text}
+            code = f"# generation failed: {e}\n"
+        return i, {"instruction": item["instruction"], "predict": code}
 
     results: list[dict | None] = [None] * len(items)
     done = 0
@@ -251,8 +284,6 @@ def evaluate(
     output_subdir: str = "results",
 ) -> dict:
     """Run TritonBench-T eval phases against an existing predictions.jsonl."""
-    import importlib.util
-
     pred_full = Path(DATA_DIR) / predictions_path
     if not pred_full.exists():
         raise FileNotFoundError(f"predictions file not found in volume: {pred_full}")
@@ -267,14 +298,17 @@ def evaluate(
     if perf_results_dir.exists():
         shutil.rmtree(perf_results_dir)
 
-    def _load(name: str, path: str):
-        spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
+    # Make the eval modules importable as `call_acc` / `exe_acc` from any
+    # subprocess (ProcessPoolExecutor in the upstream scripts pickles workers
+    # by qualified name). Image build adds symlinks so the digit-prefixed
+    # filenames resolve as valid module names.
+    eval_dir = f"{REPO_DIR}/EVAL/eval_T"
+    if eval_dir not in sys.path:
+        sys.path.insert(0, eval_dir)
+    os.environ["PYTHONPATH"] = eval_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
 
-    call_acc = _load("call_acc", f"{REPO_DIR}/EVAL/eval_T/0_call_acc.py")
-    exe_acc = _load("exe_acc", f"{REPO_DIR}/EVAL/eval_T/1_exe_acc.py")
+    import call_acc  # noqa: E402  — depends on the sys.path tweak above
+    import exe_acc   # noqa: E402
 
     total = sum(1 for _ in pred_full.open())
 
@@ -360,7 +394,6 @@ def evaluate(
         "artifacts_volume": VOLUME_NAME,
         "artifacts_subdir": output_subdir,
     }
-    print("\n" + json.dumps(summary, indent=2), flush=True)
     return summary
 
 
